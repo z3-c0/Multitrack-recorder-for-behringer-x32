@@ -1,4 +1,4 @@
-# Multitrack Recorder for Behringer X32
+# Multitrack Recorder for Behringer X32 (And probably other consoles)
 
 This project is still in development so may not work as expected.  
 Inspired by https://github.com/jajito/X32-Recorder/tree/main
@@ -8,8 +8,6 @@ It allows recording and playback of 16-channel audio from a Behringer X32 (or an
 
 This project was primarily created to enable devices like **Odroid** or **Raspberry Pi** to stay connected to a X32 console, record live shows, or play multitrack `.wav` files for virtual soundcheck.
 
-
-## Requirements
 
 ### System Dependencies
 - `ffmpeg` 
