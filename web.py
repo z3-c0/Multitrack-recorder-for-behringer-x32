@@ -168,4 +168,4 @@ def emit_file_list():
 # ---------- RUN ----------
 if __name__ == "__main__":
     print("Starting Web Server...")
-    socketio.run(app, host="127.0.0.1", port=5000, debug=False)
+    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
