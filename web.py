@@ -33,6 +33,7 @@ def recordings(filename):
 def handle_connect():
     emit_status()
     emit_file_list()
+    emit_storage_options()
 
 @socketio.on("disconnect")
 def on_disconnect():
@@ -45,6 +46,7 @@ def start_record():
         engine.start_record()
         emit_status()
         emit_file_list()
+        emit_storage_options()
     except RuntimeError as e:
         emit("app_error", {"msg": str(e)})
 
@@ -53,6 +55,7 @@ def stop_record():
     engine.stop_record()
     emit_status()
     emit_file_list()
+    emit_storage_options()
 
 def playback_position_worker():
     global playback_running
@@ -135,6 +138,7 @@ def rename(data):
         engine.rename_file(data["old"], data["new"])
         emit_file_list()
         emit_status()
+        emit_storage_options()
     except Exception as e:
         emit("app_error", {"msg": str(e)})
 
@@ -146,6 +150,18 @@ def delete(data):
         engine.delete_file(data["file"])
         emit_file_list()
         emit_status()
+        emit_storage_options()
+    except Exception as e:
+        emit("app_error", {"msg": str(e)})
+
+
+@socketio.on("set_storage")
+def set_storage(data):
+    try:
+        engine.set_storage_path(data["path"])
+        emit_file_list()
+        emit_status()
+        emit_storage_options()
     except Exception as e:
         emit("app_error", {"msg": str(e)})
 
@@ -164,8 +180,14 @@ def emit_file_list():
     socketio.emit("files", files)
 
 
+def emit_storage_options():
+    socketio.emit("storage_options", {
+        "options": engine.storage_options(),
+        "current_path": str(engine.recordings_dir),
+    })
+
 
 # ---------- RUN ----------
 if __name__ == "__main__":
     print("Starting Web Server...")
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
+    socketio.run(app, host="127.0.0.1", port=5000, debug=False)

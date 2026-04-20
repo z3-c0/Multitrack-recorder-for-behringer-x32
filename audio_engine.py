@@ -3,6 +3,7 @@ import subprocess
 import time
 import os
 import signal
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -33,6 +34,7 @@ class AudioEngine:
 
         self.recordings_dir = Path(recordings_dir)
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
+        self.storage_roots = ["/media", "/mnt", "/run/media"]
 
         # playback
         self.play_proc = None
@@ -93,8 +95,80 @@ class AudioEngine:
         )
         return float(r.stdout.strip() or 0)
 
+
+    def _writable_dir(self, path: Path) -> bool:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_test"
+            probe.touch(exist_ok=True)
+            probe.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return False
+
+    def _storage_info(self, path: Path):
+        usage = shutil.disk_usage(path)
+        return {
+            "path": str(path),
+            "free_bytes": usage.free,
+            "total_bytes": usage.total,
+        }
+
+    def storage_options(self):
+        options = []
+        seen = set()
+
+        candidates = [self.recordings_dir]
+        for root in self.storage_roots:
+            root_path = Path(root)
+            if not root_path.exists():
+                continue
+            for child in root_path.iterdir():
+                if child.is_dir():
+                    candidates.append(child / "recordings")
+
+        for path in candidates:
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+
+            if not self._writable_dir(path):
+                continue
+
+            info = self._storage_info(path)
+            info["label"] = (
+                "Local Storage" if path.resolve() == self.recordings_dir.resolve()
+                else path.parent.name or str(path.parent)
+            )
+            options.append(info)
+
+        return sorted(options, key=lambda item: item["label"].lower())
+
+    def set_storage_path(self, path):
+        if self.rec_proc:
+            raise RuntimeError("Cannot change storage while recording")
+
+        target = Path(path).expanduser()
+        if not target.is_absolute():
+            raise RuntimeError("Storage path must be absolute")
+
+        if not self._writable_dir(target):
+            raise RuntimeError("Storage path is not writable")
+
+        self.recordings_dir = target
+
+    def free_space(self):
+        return self._storage_info(self.recordings_dir)
     def list_recordings(self):
-        return sorted(f.name for f in self.recordings_dir.glob("*.wav"))
+        files = []
+        for file in sorted(self.recordings_dir.glob("*.wav")):
+            size_bytes = file.stat().st_size
+            files.append({
+                "name": file.name,
+                "size_bytes": size_bytes
+            })
+        return files
 
     # ---------- RECORD ----------
     def record_time(self):
@@ -298,5 +372,8 @@ class AudioEngine:
             "file": self.play_file,
             "position": self.position(),
             "duration": self.duration,
-            "files": self.list_recordings()
+            "files": self.list_recordings(),
+            "storage_path": str(self.recordings_dir),
+            "storage_free_bytes": self.free_space()["free_bytes"],
+            "storage_total_bytes": self.free_space()["total_bytes"],
         }

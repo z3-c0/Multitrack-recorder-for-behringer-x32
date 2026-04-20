@@ -58,6 +58,15 @@
     <!-- STATUS -->
     <div class="card p-3 mb-4">
         <div id="status">Connecting...</div>
+        <div class="mt-2">
+            <small>Storage free: <span id="storageFree">0 B</span> / <span id="storageTotal">0 B</span></small><br>
+            <small>Selected storage: <span id="storagePath">-</span></small>
+        </div>
+    </div>
+
+    <div class="card p-3 mb-4">
+        <h5>Storage</h5>
+        <select id="storageSelect" class="form-select"></select>
     </div>
 
     <!-- RECORDING -->
@@ -82,6 +91,7 @@
         <h5>Playback & File Management</h5>
 
         <select id="fileSelect" class="form-select mb-3"></select>
+        <small class="d-block mb-2">File size: <span id="fileSize">-</span></small>
 
         <div class="d-flex justify-content-between">
             <small id="curTime">0:00</small>
@@ -174,6 +184,7 @@
     const recordingText = document.getElementById("recordingText");
     const fileSelect = document.getElementById("fileSelect");
     const renameModal = new bootstrap.Modal(document.getElementById('renameModal'));
+    const storageSelect = document.getElementById("storageSelect");
 
     // ---------- SOCKET LISTENERS ----------
 
@@ -185,7 +196,10 @@
         position = data.position || 0;
         device_model = data.device_model;
         statusDiv.innerHTML = data.connected ? device_model + " ✅ Connected" : "Console ❌ Not Found"
-    
+        document.getElementById("storagePath").innerText = data.storage_path || "-";
+        document.getElementById("storageFree").innerText = formatBytes(data.storage_free_bytes || 0);
+        document.getElementById("storageTotal").innerText = formatBytes(data.storage_total_bytes || 0);
+
         // ---- RECORD BUTTON ----
         const recBtn = document.getElementById("recordBtn");
         if (recording) {
@@ -253,13 +267,32 @@
         fileSelect.innerHTML = "";
 
         files.forEach(f => {
+            const name = typeof f === "string" ? f : f.name;
             const opt = document.createElement("option");
-            opt.value = f;
-            opt.text = f;
+            opt.value = name;
+            opt.text = name;
+            opt.dataset.size = typeof f === "string" ? "" : String(f.size_bytes || 0);
             fileSelect.appendChild(opt);
         });
 
-        if (files.includes(current)) fileSelect.value = current;
+        const fileNames = files.map(f => (typeof f === "string" ? f : f.name));
+        if (fileNames.includes(current)) fileSelect.value = current;
+        updateSelectedFileSize();
+    });
+
+    socket.on("storage_options", (data) => {
+        const currentPath = data.current_path || "";
+        const previous = storageSelect.value;
+        storageSelect.innerHTML = "";
+
+        (data.options || []).forEach(optData => {
+            const opt = document.createElement("option");
+            opt.value = optData.path;
+            opt.text = `${optData.label} — ${formatBytes(optData.free_bytes)} free`;
+            storageSelect.appendChild(opt);
+        });
+
+        storageSelect.value = previous || currentPath;
     });
 
     // ---------- ACTIONS ----------
@@ -310,6 +343,22 @@
         });
     }
 
+    storageSelect.addEventListener("change", () => {
+        if (!storageSelect.value) return;
+        socket.emit("set_storage", { path: storageSelect.value });
+    });
+
+    fileSelect.addEventListener("change", updateSelectedFileSize);
+
+    function updateSelectedFileSize() {
+        const selected = fileSelect.options[fileSelect.selectedIndex];
+        if (!selected || !selected.dataset.size) {
+            document.getElementById("fileSize").innerText = "-";
+            return;
+        }
+        document.getElementById("fileSize").innerText = formatBytes(Number(selected.dataset.size));
+    }
+
     // ------------ ERROR ACTIONS -----------
 
 
@@ -347,6 +396,18 @@
         const m = Math.floor(sec / 60);
         const s = sec % 60;
         return `${m}:${s.toString().padStart(2,"0")}`;
+    }
+
+    function formatBytes(bytes) {
+        if (!bytes || bytes < 1) return "0 B";
+        const units = ["B", "KB", "MB", "GB", "TB"];
+        let i = 0;
+        let value = bytes;
+        while (value >= 1024 && i < units.length - 1) {
+            value /= 1024;
+            i++;
+        }
+        return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[i]}`;
     }
 </script>
 
