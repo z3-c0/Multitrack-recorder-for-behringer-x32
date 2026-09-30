@@ -209,9 +209,11 @@ class AudioEngine:
         self.rec_file = filename
         self.rec_start = time.time()
 
-    def stop_record(self):
+    def stop_record(self, discard=False):
         if not self.rec_proc:
-            return
+            return None
+
+        filename = self.rec_file
 
         os.killpg(os.getpgid(self.rec_proc.pid), signal.SIGTERM)
         self.rec_proc.wait()
@@ -219,6 +221,13 @@ class AudioEngine:
         self.rec_proc = None
         self.rec_file = None
         self.rec_start = None
+
+        if discard and filename:
+            path = self.recordings_dir / filename
+            if path.exists():
+                path.unlink()
+
+        return filename
 
     # ---------- PLAYBACK ----------
 

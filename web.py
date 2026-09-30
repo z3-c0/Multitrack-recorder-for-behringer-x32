@@ -1,16 +1,25 @@
+import argparse
 import os
+import socket
+import sys
 from flask import Flask, render_template, send_from_directory
 from flask_socketio import SocketIO, emit
 from threading import Lock
 from audio_engine import AudioEngine
+
+MDNS_NAME = "recorder"  # advertised as http://recorder.local
+
 RECORDINGS_DIR = "recordings"
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading"
-                    )
+# manage_session=False: this app doesn't use Flask's session, and enabling
+# session management trips an incompatibility between this flask-socketio
+# version and newer Flask versions (RequestContext.session is read-only there).
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+                     manage_session=False)
 playback_thread = None
 playback_running = False
 playback_lock = Lock()
@@ -56,6 +65,16 @@ def stop_record():
     emit_status()
     emit_file_list()
     emit_storage_options()
+
+@socketio.on("discard_record")
+def discard_record():
+    try:
+        engine.stop_record(discard=True)
+        emit_status()
+        emit_file_list()
+        emit_storage_options()
+    except Exception as e:
+        emit("app_error", {"msg": str(e)})
 
 def playback_position_worker():
     global playback_running
@@ -187,7 +206,103 @@ def emit_storage_options():
     })
 
 
+def get_lan_ip():
+    """Best-effort local LAN IP (no packets are actually sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def register_mdns(port):
+    """Broadcast http://<MDNS_NAME>.local:<port> via mDNS/Zeroconf."""
+    from zeroconf import Zeroconf, ServiceInfo
+
+    ip = get_lan_ip()
+    info = ServiceInfo(
+        "_http._tcp.local.",
+        f"{MDNS_NAME}._http._tcp.local.",
+        addresses=[socket.inet_aton(ip)],
+        port=port,
+        server=f"{MDNS_NAME}.local.",
+    )
+    zc = Zeroconf()
+    zc.register_service(info)
+    return zc
+
+
+DEFAULT_LOCAL_PORT = 5000
+DEFAULT_LAN_PORT = 80
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Multitrack Recorder web server")
+    parser.add_argument(
+        "--lan", action="store_true",
+        help="Bind to 0.0.0.0 so other devices on the network can connect "
+             f"(also broadcasts http://{MDNS_NAME}.local via mDNS). "
+             f"Defaults to port {DEFAULT_LAN_PORT} so the URL needs no port. "
+             "Without this flag, binds to 127.0.0.1 (local machine only)."
+    )
+    parser.add_argument(
+        "--port", type=int, default=None,
+        help=f"Port to listen on. Default is {DEFAULT_LAN_PORT} with --lan, "
+             f"or {DEFAULT_LOCAL_PORT} otherwise."
+    )
+    return parser.parse_args()
+
+
+def can_bind(host, port):
+    """Pre-flight check: can we actually bind this host:port? Avoids relying on
+    Werkzeug's own error handling, which calls sys.exit(1) instead of raising."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((host, port))
+        return True, None
+    except OSError as e:
+        return False, e
+    finally:
+        s.close()
+
+
 # ---------- RUN ----------
 if __name__ == "__main__":
-    print("Starting Web Server...")
-    socketio.run(app, host="127.0.0.1", port=5000, debug=False)
+    args = parse_args()
+    host = "0.0.0.0" if args.lan else "127.0.0.1"
+    port = args.port if args.port is not None else (
+        DEFAULT_LAN_PORT if args.lan else DEFAULT_LOCAL_PORT
+    )
+
+    ok, err = can_bind(host, port)
+    if not ok:
+        if isinstance(err, PermissionError) or getattr(err, "errno", None) == 13:
+            print(
+                f"\nERROR: Permission denied binding to port {port}.\n"
+                f"Ports below 1024 need elevated privileges. Either:\n"
+                f"  - run install.py (it sets up setcap so Python can bind low ports without root), or\n"
+                f"  - pass a higher port explicitly, e.g.: python3 web.py --lan --port 8080\n"
+            )
+        else:
+            print(f"\nERROR: Could not bind {host}:{port} ({err}).\n")
+        sys.exit(1)
+
+    zc = None
+    if args.lan:
+        try:
+            zc = register_mdns(port)
+            suffix = "" if port == 80 else f":{port}"
+            print(f"Broadcasting as http://{MDNS_NAME}.local{suffix}")
+        except Exception as e:
+            print(f"mDNS broadcast failed (continuing without it): {e}")
+
+    print(f"Starting Web Server on {host}:{port} ...")
+    try:
+        socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
+    finally:
+        if zc:
+            zc.close()
