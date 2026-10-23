@@ -49,10 +49,16 @@ def on_disconnect():
     global playback_running
     playback_running = False
 
+def record_time_worker():
+    while engine.rec_proc is not None:
+        socketio.emit("record_time", {"record_time": engine.record_time()})
+        socketio.sleep(0.25)
+
 @socketio.on("start_record")
 def start_record():
     try:
         engine.start_record()
+        socketio.start_background_task(record_time_worker)
         emit_status()
         emit_file_list()
         emit_storage_options()
@@ -107,7 +113,7 @@ def play(data):
     global playback_thread, playback_running
 
     try:
-        engine.play(data["file"])
+        engine.play(data["file"], dir=data.get("dir"))
 
         with playback_lock:
             if not playback_running:
@@ -154,7 +160,7 @@ def pause_play():
 @socketio.on("rename")
 def rename(data):
     try:
-        engine.rename_file(data["old"], data["new"])
+        engine.rename_file(data["old"], data["new"], dir=data.get("dir"))
         emit_file_list()
         emit_status()
         emit_storage_options()
@@ -166,10 +172,38 @@ def rename(data):
 @socketio.on("delete")
 def delete(data):
     try:
-        engine.delete_file(data["file"])
+        engine.delete_file(data["file"], dir=data.get("dir"))
         emit_file_list()
         emit_status()
         emit_storage_options()
+    except Exception as e:
+        emit("app_error", {"msg": str(e)})
+
+
+@socketio.on("move_file")
+def move_file(data):
+    try:
+        engine.move_file(data["file"], data["src_dir"], data["dest_dir"])
+        emit_file_list()
+        emit_status()
+        emit_storage_options()
+    except Exception as e:
+        emit("app_error", {"msg": str(e)})
+
+
+@socketio.on("move_all")
+def move_all(data):
+    try:
+        result = engine.move_all(data["dest_dir"])
+        emit_file_list()
+        emit_status()
+        emit_storage_options()
+        if result["skipped"]:
+            names = ", ".join(s["name"] for s in result["skipped"])
+            emit("app_error", {
+                "msg": f"Moved {len(result['moved'])} recording(s). "
+                       f"Skipped: {names}"
+            })
     except Exception as e:
         emit("app_error", {"msg": str(e)})
 
@@ -204,6 +238,16 @@ def emit_storage_options():
         "options": engine.storage_options(),
         "current_path": str(engine.recordings_dir),
     })
+
+
+def storage_watch_worker():
+    """Periodically re-scans mounted drives so a plugged-in USB stick shows
+    up in the Settings dropdown and Recordings list without any user action.
+    Cheap: no subprocess spawning, just os.path.ismount() + disk_usage()."""
+    while True:
+        emit_storage_options()
+        emit_file_list()
+        socketio.sleep(3)
 
 
 def get_lan_ip():
@@ -302,6 +346,7 @@ if __name__ == "__main__":
 
     print(f"Starting Web Server on {host}:{port} ...")
     try:
+        socketio.start_background_task(storage_watch_worker)
         socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
     finally:
         if zc:

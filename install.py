@@ -9,16 +9,27 @@ Usage:
     python3 install.py
 
 What it does (safe to re-run — every step checks first, skips if already done):
-  1. apt-get install: ffmpeg, alsa-utils, python3-flask-socketio
-  2. pip install --user: simple-websocket, zeroconf  (from requirements.txt)
-  3. setcap on the python3 binary so it can bind to port 80 without root/sudo,
-     enabling manual `python3 web.py --lan` runs to serve on http://recorder.local
-     with no port number needed.
-  4. Add the current user to the audio/plugdev groups (needed to access the
-     USB audio interface).
-  5. Install + enable a systemd service (multitrack-recorder.service) that runs
-     `web.py --lan` automatically on every boot, restarting it if it crashes,
-     so the app is ready at http://recorder.local as soon as the Pi powers up.
+  1. apt-get install: ffmpeg, alsa-utils, python3-venv, libcap2-bin
+  2. creates a project-local virtual environment at .venv (built with --copies,
+     so its python binary is a real file, never a symlink back to the system
+     interpreter — symlinks can't be setcap'd)
+  3. installs Python dependencies (requirements.txt + flask/flask-socketio)
+     into that venv
+  4. best-effort setcap on the venv's python so it can bind to port 80 without
+     root/sudo, enabling manual `.venv/bin/python web.py --lan` runs to serve
+     on http://recorder.local with no port number needed. This step is purely
+     a convenience for manual testing — if it fails (e.g. symlink, unsupported
+     filesystem), it's skipped with a warning rather than aborting the install,
+     because...
+  5. ...the systemd service (installed in step 7) grants port 80 access via
+     AmbientCapabilities, independent of setcap/filesystem support. That's the
+     real, supported way this app binds to port 80.
+  6. adds the current user to the audio / plugdev groups (needed to access the
+     USB audio interface)
+  7. installs and enables a systemd service (multitrack-recorder.service) that
+     runs `web.py --lan` automatically on every boot, restarting it if it
+     crashes, so the app is ready at http://recorder.local as soon as the
+     device powers up.
 
 Will prompt for your sudo password when needed (apt-get, setcap, usermod, systemctl).
 """
@@ -30,15 +41,22 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-APT_PACKAGES = ["ffmpeg", "alsa-utils", "python3-flask-socketio"]
+VENV_DIR = SCRIPT_DIR / ".venv"
 
 SERVICE_NAME = "multitrack-recorder"
 SERVICE_PATH = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 SERVICE_GROUPS = ["audio", "plugdev"]
 
+APT_PACKAGES = [
+    "ffmpeg",
+    "alsa-utils",
+    "python3-venv",
+    "libcap2-bin",
+]
+
 
 def run(cmd, **kwargs):
-    print(f"$ {' '.join(cmd)}")
+    print(f"$ {' '.join(str(part) for part in cmd)}")
     return subprocess.run(cmd, **kwargs)
 
 
@@ -58,7 +76,7 @@ def check_apt():
               "systems (including Raspberry Pi OS). Install the following manually:")
         print("  - ffmpeg")
         print("  - alsa-utils")
-        print("  - Python package: flask, flask-socketio, simple-websocket, zeroconf")
+        print("  - Python 3 venv module")
         sys.exit(1)
 
 
@@ -71,7 +89,7 @@ def apt_installed(pkg):
 
 
 def install_apt_packages():
-    step("Checking system packages (ffmpeg, alsa-utils, flask-socketio)")
+    step("Checking system packages (ffmpeg, alsa-utils, venv, libcap2-bin)")
     missing = [p for p in APT_PACKAGES if not apt_installed(p)]
 
     if not missing:
@@ -83,58 +101,81 @@ def install_apt_packages():
     run(["sudo", "apt-get", "install", "-y", *missing], check=True)
 
 
-def install_pip_packages():
-    step("Checking Python packages (simple-websocket, zeroconf)")
+def ensure_virtualenv():
+    step("Creating project virtual environment (.venv, with --copies)")
+
+    py_bin = VENV_DIR / "bin" / "python"
+
+    if VENV_DIR.exists():
+        # A venv built without --copies (or inherited from a broken earlier
+        # attempt) just symlinks back to the system python. setcap refuses to
+        # touch symlinks, so rebuild it properly rather than fighting that.
+        if py_bin.exists() and py_bin.is_symlink():
+            print("Existing venv is symlink-based; rebuilding it with --copies.")
+            shutil.rmtree(VENV_DIR)
+
+    if not VENV_DIR.exists():
+        run([sys.executable, "-m", "venv", "--copies", str(VENV_DIR)], check=True)
+
+    if not py_bin.exists():
+        print(f"Virtualenv python not found at {py_bin}")
+        sys.exit(1)
+
+    # Old/bundled pip can be too old to install some wheels cleanly; upgrading
+    # inside the venv is cheap and avoids a whole class of install failures.
+    run([str(py_bin), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], check=True)
+
     req_file = SCRIPT_DIR / "requirements.txt"
+    if req_file.exists():
+        run([str(py_bin), "-m", "pip", "install", "-r", str(req_file)], check=True)
 
-    to_install = []
-    for pkg in ["simple_websocket", "zeroconf"]:
-        r = subprocess.run(
-            [sys.executable, "-c", f"import {pkg}"],
-            capture_output=True
-        )
-        if r.returncode != 0:
-            to_install.append(pkg)
+    # Flask is required by the app itself and is not always in requirements.txt
+    run([str(py_bin), "-m", "pip", "install", "flask", "flask-socketio"], check=True)
 
-    if not to_install:
-        print("All required Python packages already installed.")
+    return str(py_bin)
+
+
+def maybe_setcap_for_manual_runs(python_bin):
+    """
+    Best-effort only. Lets you run `.venv/bin/python web.py --lan` directly on
+    port 80 without sudo. Never fatal: the systemd service (AmbientCapabilities)
+    is what actually matters for the real deployment, and doesn't depend on this
+    succeeding.
+    """
+    step("Enabling port 80 for manual runs (setcap on venv python)")
+
+    p = Path(python_bin)
+    if not p.exists():
+        print(f"Python binary not found: {p}; skipping setcap.")
         return
 
-    print(f"Installing missing Python packages: {', '.join(to_install)}")
-    run(
-        [sys.executable, "-m", "pip", "install", "--user",
-         "--break-system-packages", "-r", str(req_file)],
-        check=True
-    )
-
-
-def resolve_python_bin():
-    python_bin = Path(subprocess.run(
-        ["readlink", "-f", sys.executable],
-        capture_output=True, text=True
-    ).stdout.strip())
-    return python_bin if python_bin.exists() else None
-
-
-def setup_port80_capability(python_bin):
-    step("Enabling port 80 without sudo (setcap on python3)")
-
-    if not python_bin:
-        print(f"Could not resolve python binary path ({sys.executable}); skipping setcap.")
+    # setcap refuses to operate on symlinks — skip rather than fail.
+    if p.is_symlink():
+        print(f"Skipping setcap for symlinked Python: {p}")
         return
 
-    r = subprocess.run(["getcap", str(python_bin)], capture_output=True, text=True)
-    if "cap_net_bind_service" in r.stdout:
-        print(f"{python_bin} already has cap_net_bind_service. Skipping.")
+    real = p.resolve(strict=False)
+    if str(real) in {"/usr/bin/python3", "/usr/local/bin/python3"}:
+        print(f"Skipping setcap for system Python: {real}")
+        print("Port 80 will be handled by the systemd service via AmbientCapabilities=CAP_NET_BIND_SERVICE.")
+        return
+
+    result = subprocess.run(["getcap", str(p)], capture_output=True, text=True)
+    if "cap_net_bind_service" in result.stdout:
+        print(f"{p} already has cap_net_bind_service. Skipping.")
         return
 
     if not shutil.which("setcap"):
-        print("setcap not found — installing libcap2-bin...")
+        print("setcap not found; installing libcap2-bin...")
         run(["sudo", "apt-get", "install", "-y", "libcap2-bin"], check=True)
 
-    print(f"Granting {python_bin} permission to bind ports < 1024...")
-    print("NOTE: this applies to ALL scripts run with this python3 binary, not just this app.")
-    run(["sudo", "setcap", "cap_net_bind_service=+ep", str(python_bin)], check=True)
+    print(f"Granting {p} permission to bind ports below 1024...")
+    try:
+        run(["sudo", "setcap", "cap_net_bind_service=+ep", str(p)], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"WARNING: setcap failed (exit {e.returncode}); skipping.")
+        print("This is only needed for manual `--lan` runs on port 80 without sudo.")
+        print("The systemd service does not need this — it uses AmbientCapabilities instead.")
 
 
 def ensure_user_in_groups(user):
@@ -210,17 +251,16 @@ def main():
     check_apt()
 
     user = getpass.getuser()
-    python_bin = resolve_python_bin()
 
     try:
         install_apt_packages()
-        install_pip_packages()
-        setup_port80_capability(python_bin)
+        python_bin = ensure_virtualenv()
+        maybe_setcap_for_manual_runs(python_bin)  # best-effort, never fatal
         ensure_user_in_groups(user)
         install_systemd_service(user, python_bin)
         enable_and_start_service()
     except subprocess.CalledProcessError as e:
-        print(f"\nERROR: command failed ({' '.join(e.cmd)}), exit code {e.returncode}.")
+        print(f"\nERROR: command failed ({' '.join(str(c) for c in e.cmd)}), exit code {e.returncode}.")
         print("Fix the issue above and re-run this script — it's safe to run multiple times.")
         sys.exit(1)
 
@@ -231,8 +271,8 @@ def main():
     print(f"  Restart:        sudo systemctl restart {SERVICE_NAME}")
     print()
     print("You can still run it manually for testing (this won't affect the service):")
-    print("  python3 web.py            # local only, http://127.0.0.1:5000")
-    print("  python3 web.py --lan      # LAN-accessible, http://recorder.local")
+    print(f"  {VENV_DIR}/bin/python web.py            # local only, http://127.0.0.1:5000")
+    print(f"  {VENV_DIR}/bin/python web.py --lan      # LAN-accessible, http://recorder.local")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ class AudioEngine:
         # playback
         self.play_proc = None
         self.play_file = None
+        self.play_dir = None
         self.play_start = None
         self.play_offset = 0.0
         self.duration = 0.0
@@ -114,20 +115,52 @@ class AudioEngine:
             "total_bytes": usage.total,
         }
 
-    def storage_options(self):
-        options = []
-        seen = set()
-
-        candidates = [self.recordings_dir]
+    def _discover_mount_points(self):
+        """
+        Find mounted volumes under the conventional auto-mount roots, at
+        either nesting depth: /media/<label> (common on minimal setups) or
+        /media/<user>/<label> and /run/media/<user>/<label> (the udisks2
+        convention most desktop-session automounters use). os.path.ismount()
+        verifies it's an actual separate filesystem, not just any directory,
+        so this works regardless of username or distro.
+        """
+        found = []
         for root in self.storage_roots:
             root_path = Path(root)
             if not root_path.exists():
                 continue
-            for child in root_path.iterdir():
-                if child.is_dir():
-                    candidates.append(child / "recordings")
+            try:
+                children = list(root_path.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if os.path.ismount(child):
+                    found.append(child)
+                elif child.is_dir():
+                    try:
+                        grandchildren = list(child.iterdir())
+                    except OSError:
+                        continue
+                    for grandchild in grandchildren:
+                        if os.path.ismount(grandchild):
+                            found.append(grandchild)
+        return found
 
-        for path in candidates:
+    def _known_storage_dirs(self):
+        """Every writable recordings directory the app currently knows about:
+        the active local storage plus a 'recordings' subfolder on each
+        mounted volume. Backing for both the storage picker and file moves."""
+        dirs = [{"path": self.recordings_dir, "label": "Local Storage"}]
+        for mount in self._discover_mount_points():
+            dirs.append({"path": mount / "recordings", "label": mount.name})
+        return dirs
+
+    def storage_options(self):
+        options = []
+        seen = set()
+
+        for entry in self._known_storage_dirs():
+            path = entry["path"]
             resolved = str(path.resolve())
             if resolved in seen:
                 continue
@@ -137,10 +170,7 @@ class AudioEngine:
                 continue
 
             info = self._storage_info(path)
-            info["label"] = (
-                "Local Storage" if path.resolve() == self.recordings_dir.resolve()
-                else path.parent.name or str(path.parent)
-            )
+            info["label"] = entry["label"]
             options.append(info)
 
         return sorted(options, key=lambda item: item["label"].lower())
@@ -162,12 +192,21 @@ class AudioEngine:
         return self._storage_info(self.recordings_dir)
     def list_recordings(self):
         files = []
-        for file in sorted(self.recordings_dir.glob("*.wav")):
-            size_bytes = file.stat().st_size
-            files.append({
-                "name": file.name,
-                "size_bytes": size_bytes
-            })
+        seen_dirs = set()
+        for entry in self._known_storage_dirs():
+            path = entry["path"]
+            resolved = str(path.resolve()) if path.exists() else str(path)
+            if resolved in seen_dirs or not path.is_dir():
+                continue
+            seen_dirs.add(resolved)
+
+            for file in sorted(path.glob("*.wav")):
+                files.append({
+                    "name": file.name,
+                    "size_bytes": file.stat().st_size,
+                    "dir": str(path.resolve()),
+                    "label": entry["label"],
+                })
         return files
 
     # ---------- RECORD ----------
@@ -229,13 +268,30 @@ class AudioEngine:
 
         return filename
 
+    # ---------- FILE LOCATION RESOLUTION ----------
+
+    def _resolve_dir(self, dir=None):
+        """Resolve a client-supplied directory to one of the app's known
+        storage dirs (local or a mounted drive's recordings folder),
+        defaulting to the active local storage. Rejects anything that isn't
+        a known dir rather than trusting an arbitrary client-supplied path."""
+        if dir is None:
+            return self.recordings_dir
+
+        target = str(Path(dir).resolve())
+        for entry in self._known_storage_dirs():
+            if str(entry["path"].resolve()) == target:
+                return entry["path"]
+        raise RuntimeError("Unknown storage directory")
+
     # ---------- PLAYBACK ----------
 
-    def play(self, filename, offset=0.0):
+    def play(self, filename, dir=None, offset=0.0):
         if self.rec_proc:
             raise RuntimeError("Recording in progress")
 
-        path = self.recordings_dir / filename
+        base = self._resolve_dir(dir)
+        path = base / filename
         if not path.exists():
             raise FileNotFoundError(filename)
 
@@ -257,6 +313,7 @@ class AudioEngine:
 
         self.play_proc = subprocess.Popen(cmd)
         self.play_file = filename
+        self.play_dir = str(base.resolve())
         self.play_start = time.time()
         self.play_offset = offset
         self.paused = False
@@ -287,6 +344,7 @@ class AudioEngine:
 
         self.play_proc = None
         self.play_file = None
+        self.play_dir = None
         self.play_start = None
         self.play_offset = 0.0
         self.duration = 0.0
@@ -300,6 +358,7 @@ class AudioEngine:
         if self.play_proc.poll() is not None:
             self.play_proc = None
             self.play_file = None
+            self.play_dir = None
             self.play_start = None
             self.play_offset = 0.0
             self.duration = 0.0
@@ -311,7 +370,7 @@ class AudioEngine:
             return
 
         was_paused = self.paused
-        self.play(self.play_file, offset=seconds)
+        self.play(self.play_file, dir=self.play_dir, offset=seconds)
 
         if was_paused:
             self.pause()
@@ -333,17 +392,19 @@ class AudioEngine:
 
     # ---------- FILE OPS ----------
 
-    def rename_file(self, old, new):
+    def rename_file(self, old, new, dir=None):
         if self.rec_proc:
             raise RuntimeError("Recording in progress")
-        if self.play_file == old:
+
+        base = self._resolve_dir(dir)
+        if self.play_file == old and self.play_dir == str(base.resolve()):
             raise RuntimeError("File is playing")
 
         if not new.endswith(".wav"):
             new += ".wav"
 
-        src = self.recordings_dir / old
-        dst = self.recordings_dir / new
+        src = base / old
+        dst = base / new
 
         if not src.exists():
             raise FileNotFoundError(old)
@@ -352,17 +413,59 @@ class AudioEngine:
 
         src.rename(dst)
 
-    def delete_file(self, filename):
+    def delete_file(self, filename, dir=None):
         if self.rec_proc:
             raise RuntimeError("Recording in progress")
-        if self.play_file == filename:
+
+        base = self._resolve_dir(dir)
+        if self.play_file == filename and self.play_dir == str(base.resolve()):
             raise RuntimeError("File is playing")
 
-        path = self.recordings_dir / filename
+        path = base / filename
         if not path.exists():
             raise FileNotFoundError(filename)
 
         path.unlink()
+
+    def move_file(self, filename, src_dir, dest_dir):
+        if self.rec_proc and self.rec_file == filename and \
+                self.recordings_dir.resolve() == Path(src_dir).resolve():
+            raise RuntimeError("Recording in progress")
+
+        src_base = self._resolve_dir(src_dir)
+        dest_base = self._resolve_dir(dest_dir)
+
+        if self.play_file == filename and self.play_dir == str(src_base.resolve()):
+            raise RuntimeError("File is playing")
+
+        src = src_base / filename
+        dst = dest_base / filename
+
+        if not src.exists():
+            raise FileNotFoundError(filename)
+        if src.resolve() == dst.resolve():
+            raise RuntimeError("File is already at that location")
+        if dst.exists():
+            raise RuntimeError("Target file exists")
+
+        dest_base.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+
+    def move_all(self, dest_dir):
+        dest_base = self._resolve_dir(dest_dir)
+        moved = []
+        skipped = []
+
+        for file in self.list_recordings():
+            if Path(file["dir"]).resolve() == dest_base.resolve():
+                continue
+            try:
+                self.move_file(file["name"], file["dir"], str(dest_base))
+                moved.append(file["name"])
+            except Exception as e:
+                skipped.append({"name": file["name"], "reason": str(e)})
+
+        return {"moved": moved, "skipped": skipped}
 
     # ---------- STATUS ----------
 
@@ -379,6 +482,7 @@ class AudioEngine:
             "playing": self.play_proc is not None,
             "paused": self.paused,
             "file": self.play_file,
+            "file_dir": self.play_dir,
             "position": self.position(),
             "duration": self.duration,
             "files": self.list_recordings(),

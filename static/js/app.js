@@ -7,12 +7,16 @@ let paused = false;
 let duration = 0;
 let position = 0;
 let currentPlayFile = null;
+let currentPlayDir = null;
 let recordTime = 0;
-let filesData = [];       // last "files" payload from server
-let expandedFile = null;  // which recording row is expanded
+let filesData = [];          // last "files" payload from server
+let storageOptionsData = []; // last "storage_options" payload from server
+let expandedKey = null;      // which recording row is expanded (dir+name composite key)
 let searchQuery = "";
-let renameTarget = null;
-let deleteTarget = null;
+let renameTarget = null;     // {name, dir}
+let deleteTarget = null;     // {name, dir}
+let moveTarget = null;       // {name, dir} for a single move, null in "move all" mode
+let moveAllMode = false;
 
 // ---------- DOM ----------
 const viewRecord = document.getElementById("view-record");
@@ -21,9 +25,6 @@ const viewRecordings = document.getElementById("view-recordings");
 const micBtn = document.getElementById("micBtn");
 const timerText = document.getElementById("timerText");
 const recordHint = document.getElementById("recordHint");
-const recordControls = document.getElementById("recordControls");
-const discardBtn = document.getElementById("discardBtn");
-const finishBtn = document.getElementById("finishBtn");
 const recordWaveform = document.getElementById("recordWaveform");
 const statusDot = document.getElementById("statusDot");
 const statusDotRecordings = document.getElementById("statusDotRecordings");
@@ -48,6 +49,11 @@ const renameInput = document.getElementById("renameInput");
 
 const deleteModal = new bootstrap.Modal(document.getElementById("deleteModal"));
 
+const moveAllBtn = document.getElementById("moveAllBtn");
+const moveModal = new bootstrap.Modal(document.getElementById("moveModal"));
+const moveModalTitle = document.getElementById("moveModalTitle");
+const moveDestSelect = document.getElementById("moveDestSelect");
+
 const errorModal = new bootstrap.Modal(document.getElementById("errorModal"));
 const errorMessage = document.getElementById("errorMessage");
 
@@ -60,6 +66,11 @@ function showView(name) {
 settingsBtn.addEventListener("click", () => settingsModal.show());
 recordingsBtn.addEventListener("click", () => showView("recordings"));
 backBtn.addEventListener("click", () => showView("record"));
+
+// ---------- FILE IDENTITY ----------
+function fileKey(dir, name) {
+    return (dir || "") + "|" + name;
+}
 
 // ---------- WAVEFORM HELPERS ----------
 // Deterministic pseudo-random bar heights, seeded by a string (filename).
@@ -115,6 +126,7 @@ socket.on("status", (data) => {
     duration = data.duration || 0;
     position = data.position || 0;
     currentPlayFile = data.file || null;
+    currentPlayDir = data.file_dir || null;
     recordTime = data.record_time || 0;
 
     const connected = !!data.connected;
@@ -130,15 +142,11 @@ socket.on("status", (data) => {
     // ---- mic / record UI ----
     if (recording) {
         micBtn.classList.add("recording");
-        micBtn.disabled = true;
-        recordHint.textContent = "Recording...";
-        recordControls.classList.remove("hidden");
+        recordHint.textContent = "Recording... tap to stop";
         if (!recordWaveformTimer) startRecordWaveformAnim();
     } else {
         micBtn.classList.remove("recording");
-        micBtn.disabled = false;
         recordHint.textContent = "Tap to record";
-        recordControls.classList.add("hidden");
         stopRecordWaveformAnim();
     }
     timerText.textContent = formatDuration(recordTime);
@@ -154,12 +162,18 @@ socket.on("position", (data) => {
     updateExpandedPlaybackUI();
 });
 
+socket.on("record_time", (data) => {
+    recordTime = data.record_time || 0;
+    timerText.textContent = formatDuration(recordTime);
+});
+
 socket.on("files", (files) => {
     filesData = files || [];
     renderRecordingsList();
 });
 
 socket.on("storage_options", (data) => {
+    storageOptionsData = data.options || [];
     const currentPath = data.current_path || "";
     const previous = storageSelect.value;
     storageSelect.innerHTML = "";
@@ -180,17 +194,12 @@ socket.on("app_error", (data) => {
 
 // ---------- RECORD VIEW ACTIONS ----------
 micBtn.addEventListener("click", () => {
-    if (recording) return;
-    socket.emit("start_record");
-});
-
-discardBtn.addEventListener("click", () => {
-    socket.emit("discard_record");
-});
-
-finishBtn.addEventListener("click", () => {
-    socket.emit("stop_record");
-    showView("recordings");
+    if (recording) {
+        socket.emit("stop_record");
+        showView("recordings");
+    } else {
+        socket.emit("start_record");
+    }
 });
 
 // ---------- RECORDINGS VIEW ----------
@@ -238,9 +247,11 @@ function renderRecordingsList() {
     files.slice().reverse().forEach((f) => {
         const name = typeof f === "string" ? f : f.name;
         const size = typeof f === "string" ? 0 : (f.size_bytes || 0);
+        const dir = typeof f === "string" ? null : (f.dir || null);
+        const label = typeof f === "string" ? "Local Storage" : (f.label || "Local Storage");
         const meta = parseFileMeta(name);
         if (!groups.has(meta.group)) groups.set(meta.group, []);
-        groups.get(meta.group).push({ name, size, meta });
+        groups.get(meta.group).push({ name, size, dir, label, meta });
     });
 
     groups.forEach((rows, groupName) => {
@@ -254,9 +265,10 @@ function renderRecordingsList() {
 }
 
 function buildRecordingRow(row) {
-    const { name, size, meta } = row;
-    const isCurrent = currentPlayFile === name;
-    const isExpanded = expandedFile === name;
+    const { name, size, dir, label, meta } = row;
+    const key = fileKey(dir, name);
+    const isCurrent = key === fileKey(currentPlayDir, currentPlayFile);
+    const isExpanded = expandedKey === key;
 
     const wrap = document.createElement("div");
     wrap.className = "rec-row" + (isCurrent && playing ? " playing" : "") + (isExpanded ? " expanded" : "");
@@ -269,7 +281,7 @@ function buildRecordingRow(row) {
     playBtn.textContent = isCurrent && playing && !paused ? "⏸" : "▶";
     playBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        handleRowPlayClick(name);
+        handleRowPlayClick(name, dir);
     });
 
     const info = document.createElement("div");
@@ -282,6 +294,12 @@ function buildRecordingRow(row) {
     metaEl.textContent = meta.dateStr ? `${meta.dateStr} | ${formatBytes(size)}` : formatBytes(size);
     info.appendChild(nameEl);
     info.appendChild(metaEl);
+    if (label && label !== "Local Storage") {
+        const locEl = document.createElement("div");
+        locEl.className = "rec-location";
+        locEl.textContent = label;
+        info.appendChild(locEl);
+    }
 
     const durEl = document.createElement("div");
     durEl.className = "rec-duration";
@@ -292,7 +310,7 @@ function buildRecordingRow(row) {
     main.appendChild(durEl);
 
     main.addEventListener("click", () => {
-        expandedFile = isExpanded ? null : name;
+        expandedKey = isExpanded ? null : key;
         renderRecordingsList();
     });
 
@@ -304,7 +322,7 @@ function buildRecordingRow(row) {
 
     const wf = document.createElement("div");
     wf.className = "waveform small";
-    wf.id = "wf-" + cssEscape(name);
+    wf.id = "wf-" + cssEscape(key);
     expanded.appendChild(wf);
 
     const timeRow = document.createElement("div");
@@ -344,9 +362,18 @@ function buildRecordingRow(row) {
     renameBtn.textContent = "✎";
     renameBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        renameTarget = name;
+        renameTarget = { name, dir };
         renameInput.value = "";
         renameModal.show();
+    });
+
+    const moveBtn = document.createElement("button");
+    moveBtn.className = "move-btn";
+    moveBtn.title = "Move";
+    moveBtn.textContent = "📤";
+    moveBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openMoveModal({ name, dir });
     });
 
     const deleteBtn = document.createElement("button");
@@ -355,11 +382,12 @@ function buildRecordingRow(row) {
     deleteBtn.textContent = "🗑";
     deleteBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        deleteTarget = name;
+        deleteTarget = { name, dir };
         deleteModal.show();
     });
 
     actions.appendChild(renameBtn);
+    actions.appendChild(moveBtn);
     actions.appendChild(deleteBtn);
     expanded.appendChild(actions);
 
@@ -378,23 +406,24 @@ function cssEscape(s) {
     return s.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
-function handleRowPlayClick(name) {
-    const isCurrent = currentPlayFile === name;
+function handleRowPlayClick(name, dir) {
+    const isCurrent = fileKey(dir, name) === fileKey(currentPlayDir, currentPlayFile);
     if (isCurrent && playing) {
         socket.emit("pause_play");
     } else {
-        socket.emit("play", { file: name });
-        expandedFile = name;
+        socket.emit("play", { file: name, dir: dir });
+        expandedKey = fileKey(dir, name);
     }
 }
 
 function updateExpandedPlaybackUI() {
-    if (!expandedFile || expandedFile !== currentPlayFile) return;
+    const currentKey = fileKey(currentPlayDir, currentPlayFile);
+    if (!expandedKey || expandedKey !== currentKey) return;
 
     const curEl = document.querySelector(".rec-row.expanded .rec-cur-time");
     const totalEl = document.querySelector(".rec-row.expanded .rec-total-time");
     const seekEl = document.querySelector(".rec-row.expanded .rec-seekbar");
-    const wfEl = document.getElementById("wf-" + cssEscape(expandedFile));
+    const wfEl = document.getElementById("wf-" + cssEscape(expandedKey));
 
     if (curEl) curEl.textContent = formatDuration(position);
     if (totalEl) totalEl.textContent = formatDuration(duration);
@@ -404,7 +433,7 @@ function updateExpandedPlaybackUI() {
     }
     if (wfEl) {
         const ratio = duration ? position / duration : 0;
-        renderWaveform(wfEl, expandedFile, 40, ratio);
+        renderWaveform(wfEl, currentPlayFile, 40, ratio);
     }
 }
 
@@ -413,17 +442,61 @@ document.getElementById("confirmRenameBtn").addEventListener("click", () => {
     const newName = renameInput.value.trim();
     if (!newName || !renameTarget) return;
 
-    socket.emit("rename", { old: renameTarget, new: newName });
+    socket.emit("rename", { old: renameTarget.name, new: newName, dir: renameTarget.dir });
     renameTarget = null;
     renameModal.hide();
 });
 
 document.getElementById("confirmDeleteBtn").addEventListener("click", () => {
     if (!deleteTarget) return;
-    socket.emit("delete", { file: deleteTarget });
-    if (expandedFile === deleteTarget) expandedFile = null;
+    socket.emit("delete", { file: deleteTarget.name, dir: deleteTarget.dir });
+    if (expandedKey === fileKey(deleteTarget.dir, deleteTarget.name)) expandedKey = null;
     deleteTarget = null;
     deleteModal.hide();
+});
+
+// ---------- MODALS: move / move all ----------
+function openMoveModal(target) {
+    moveTarget = target;
+    moveAllMode = false;
+    moveModalTitle.textContent = "Move Recording";
+    populateMoveDestinations(target.dir);
+    moveModal.show();
+}
+
+moveAllBtn.addEventListener("click", () => {
+    moveTarget = null;
+    moveAllMode = true;
+    moveModalTitle.textContent = "Move All Recordings";
+    populateMoveDestinations(null);
+    moveModal.show();
+});
+
+function populateMoveDestinations(excludeDir) {
+    moveDestSelect.innerHTML = "";
+    storageOptionsData
+        .filter((opt) => !excludeDir || opt.path !== excludeDir)
+        .forEach((opt) => {
+            const el = document.createElement("option");
+            el.value = opt.path;
+            el.text = `${opt.label} — ${formatBytes(opt.free_bytes)} free`;
+            moveDestSelect.appendChild(el);
+        });
+}
+
+document.getElementById("confirmMoveBtn").addEventListener("click", () => {
+    const dest = moveDestSelect.value;
+    if (!dest) return;
+
+    if (moveAllMode) {
+        socket.emit("move_all", { dest_dir: dest });
+    } else if (moveTarget) {
+        socket.emit("move_file", { file: moveTarget.name, src_dir: moveTarget.dir, dest_dir: dest });
+    }
+
+    moveTarget = null;
+    moveAllMode = false;
+    moveModal.hide();
 });
 
 function showErrorModal(message) {

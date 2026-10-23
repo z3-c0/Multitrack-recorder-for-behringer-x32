@@ -30,11 +30,6 @@
         <div class="record-hint" id="recordHint">Tap to record</div>
 
         <div class="waveform" id="recordWaveform"></div>
-
-        <div class="record-controls hidden" id="recordControls">
-            <button class="circle-btn discard" id="discardBtn" title="Discard">&#10005;</button>
-            <button class="circle-btn finish" id="finishBtn" title="Finish">&#10003;</button>
-        </div>
     </div>
 
     <!-- ============ RECORDINGS VIEW ============ -->
@@ -42,6 +37,7 @@
         <div class="topbar">
             <button class="icon-btn" id="backBtn" title="Back">&#8592;</button>
             <div class="title"><span class="status-dot" id="statusDotRecordings"></span>Recordings</div>
+            <button class="icon-btn" id="moveAllBtn" title="Move all">&#128228;</button>
         </div>
 
         <div class="search-input-wrap">
@@ -110,6 +106,25 @@
             <div class="modal-footer border-0">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-warning" id="confirmRenameBtn">Rename</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ============ MOVE MODAL ============ -->
+<div class="modal fade" id="moveModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header border-0">
+                <h5 class="modal-title" id="moveModalTitle">Move Recording</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <select id="moveDestSelect" class="form-select"></select>
+            </div>
+            <div class="modal-footer border-0">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-warning" id="confirmMoveBtn">Move</button>
             </div>
         </div>
     </div>
