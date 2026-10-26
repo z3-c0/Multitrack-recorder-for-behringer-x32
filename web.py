@@ -32,6 +32,11 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/kiosk")
+def kiosk():
+    return render_template("kiosk.html")
+
+
 @app.route("/recordings/<path:filename>")
 def recordings(filename):
     return send_from_directory(RECORDINGS_DIR, filename)
