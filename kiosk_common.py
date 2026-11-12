@@ -90,7 +90,10 @@ def active_display_manager():
     )
     if r.returncode == 0 and "=" in r.stdout:
         unit = r.stdout.strip().split("=", 1)[1]
-        if unit:
+        # If the alias has no configured target, systemd may report the alias
+        # itself as its Id. It is not a real unit to disable; check known DMs
+        # below instead.
+        if unit and unit != "display-manager.service":
             return unit
 
     for dm in KNOWN_DISPLAY_MANAGERS:
@@ -145,7 +148,7 @@ def write_xinitrc(exec_line):
     )
 
     if xinitrc.exists() and xinitrc.read_text() == content:
-        print(f"{xinitrc} already up to date. Skipping write.")
+        print(f"{xinitrc} already up to date. Skipping.")
         return
 
     xinitrc.write_text(content)
